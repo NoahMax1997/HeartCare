@@ -1,6 +1,15 @@
 import Combine
 import Foundation
 
+struct SyncDelta {
+    var heartRateAdded: Int = 0
+    var respiratoryAdded: Int = 0
+    var hrvAdded: Int = 0
+    var sleepIntervalsAdded: Int = 0
+
+    static let zero = SyncDelta()
+}
+
 @MainActor
 final class VitalStore: ObservableObject {
     @Published private(set) var records: [VitalMinuteRecord] = []
@@ -17,6 +26,8 @@ final class VitalStore: ObservableObject {
     @Published var isSyncing = false
     @Published var lastError: String?
     @Published var authorizationStatus: String = "未授权"
+    @Published private(set) var lastSyncDate: Date?
+    @Published private(set) var lastSyncDelta: SyncDelta = .zero
 
     private let healthKitService = HealthKitService()
     private let coreMotionService = CoreMotionService()
@@ -29,6 +40,9 @@ final class VitalStore: ObservableObject {
     private let autoSyncIntervalNanoseconds: UInt64 = 10 * 60 * 1_000_000_000
     private let database: VitalDatabase?
     private var autoSyncTask: Task<Void, Never>?
+    private static let syncLockUntilKey = "vital.syncLockUntil"
+    private static let syncLockTokenKey = "vital.syncLockToken"
+    private static let syncLockDuration: TimeInterval = 120
 
     init() {
         do {
@@ -55,6 +69,7 @@ final class VitalStore: ObservableObject {
             walkingSamples = try database.fetchRawSamples(kind: .walking)
             runningSamples = try database.fetchRawSamples(kind: .running)
             sedentarySamples = try database.fetchRawSamples(kind: .sedentary)
+            lastSyncDate = UserDefaults.standard.object(forKey: lastSyncKey) as? Date
         } catch {
             lastError = "读取本地数据失败: \(error.localizedDescription)"
         }
@@ -74,27 +89,33 @@ final class VitalStore: ObservableObject {
 
     func sync() async {
         guard !isSyncing else { return }
+        guard let lockToken = Self.acquireSyncLock() else { return }
+        defer { Self.releaseSyncLock(token: lockToken) }
         isSyncing = true
         defer { isSyncing = false }
         guard let database else { return }
 
         let isInitialBackfillDone = UserDefaults.standard.bool(forKey: initialNinetyDayBackfillDoneKey)
-        let windowDays = isInitialBackfillDone ? 1 : 90
+        let hasExistingHealthData = hasAnyHealthRawSamples(database: database)
+        let shouldRunInitialBackfill = !isInitialBackfillDone || !hasExistingHealthData
+        let windowDays = shouldRunInitialBackfill ? 90 : 1
         let windowSince = calendar.date(byAdding: .day, value: -windowDays, to: Date())
             ?? Date().addingTimeInterval(Double(-windowDays * 24 * 3600))
-        await runIndependentSyncPipelines(
+        let healthSyncSucceeded = await runIndependentSyncPipelines(
             database: database,
             healthWindowSince: windowSince,
             motionWindowSince: windowSince,
             shouldPruneOldData: false
         )
-        if !isInitialBackfillDone {
+        if shouldRunInitialBackfill && healthSyncSucceeded {
             UserDefaults.standard.set(true, forKey: initialNinetyDayBackfillDoneKey)
         }
     }
 
     func syncRecent7Days() async {
         guard !isSyncing else { return }
+        guard let lockToken = Self.acquireSyncLock() else { return }
+        defer { Self.releaseSyncLock(token: lockToken) }
         isSyncing = true
         defer { isSyncing = false }
         guard let database else { return }
@@ -109,16 +130,26 @@ final class VitalStore: ObservableObject {
         )
     }
 
+    func shouldSyncOnActive(minimumInterval: TimeInterval = 10 * 60) -> Bool {
+        guard let lastSync = UserDefaults.standard.object(forKey: lastSyncKey) as? Date else {
+            return true
+        }
+        return Date().timeIntervalSince(lastSync) >= minimumInterval
+    }
+
     private func runIndependentSyncPipelines(
         database: VitalDatabase,
         healthWindowSince: Date,
         motionWindowSince: Date,
         shouldPruneOldData: Bool
-    ) async {
+    ) async -> Bool {
         var pipelineErrors: [String] = []
+        var healthSyncSucceeded = false
+        var healthDelta: SyncDelta = .zero
 
         do {
-            try await syncHealthPipeline(database: database, windowSince: healthWindowSince)
+            healthDelta = try await syncHealthPipeline(database: database, windowSince: healthWindowSince)
+            healthSyncSucceeded = true
         } catch {
             pipelineErrors.append("健康数据同步失败: \(error.localizedDescription)")
         }
@@ -145,31 +176,60 @@ final class VitalStore: ObservableObject {
         }
 
         refresh()
-        saveLastSyncDate(Date())
+        if healthSyncSucceeded {
+            saveLastSyncDate(Date())
+            lastSyncDate = UserDefaults.standard.object(forKey: lastSyncKey) as? Date
+            lastSyncDelta = healthDelta
+        }
         saveLastActivitySyncDate(Date())
         lastError = pipelineErrors.isEmpty ? nil : pipelineErrors.joined(separator: " | ")
+        return healthSyncSucceeded
     }
 
-    private func syncHealthPipeline(database: VitalDatabase, windowSince: Date) async throws {
+    private func hasAnyHealthRawSamples(database: VitalDatabase) -> Bool {
+        let healthKinds: [VitalSample.Kind] = [.heartRate, .respiratoryRate, .hrv, .sleep]
+        for kind in healthKinds {
+            if (try? database.latestRawSampleTimestamp(kind: kind)) ?? nil != nil {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func syncHealthPipeline(database: VitalDatabase, windowSince: Date) async throws -> SyncDelta {
         let fetchedHealth = try await healthKitService.fetchSamples(since: windowSince)
         let fetchedSleepIntervals = try await healthKitService.fetchSleepIntervals(since: windowSince)
-        let healthKinds: Set<VitalSample.Kind> = [.heartRate, .respiratoryRate, .hrv]
-        var newHealthSamples: [VitalSample] = []
-        for kind in healthKinds {
-            let latestTimestamp = try database.latestRawSampleTimestamp(kind: kind)
-            let fresh = fetchedHealth.filter { sample in
-                sample.kind == kind && sample.timestamp > (latestTimestamp ?? .distantPast)
-            }
-            newHealthSamples.append(contentsOf: fresh)
+        let latestHeartRateTimestamp = try database.latestRawSampleTimestamp(kind: .heartRate)
+        let latestRespiratoryTimestamp = try database.latestRawSampleTimestamp(kind: .respiratoryRate)
+        let latestHrvTimestamp = try database.latestRawSampleTimestamp(kind: .hrv)
+
+        let newHeartRateSamples = fetchedHealth.filter {
+            $0.kind == .heartRate && $0.timestamp > (latestHeartRateTimestamp ?? .distantPast)
         }
+        let newRespiratorySamples = fetchedHealth.filter {
+            $0.kind == .respiratoryRate && $0.timestamp > (latestRespiratoryTimestamp ?? .distantPast)
+        }
+        let newHrvSamples = fetchedHealth.filter {
+            $0.kind == .hrv && $0.timestamp > (latestHrvTimestamp ?? .distantPast)
+        }
+
+        let newHealthSamples = newHeartRateSamples + newRespiratorySamples + newHrvSamples
         let backfillSleep = try await healthKitService.fetchActivitySamples(since: windowSince)
             .filter { $0.kind == .sleep }
         let aggregates = VitalAggregation.aggregate(samples: newHealthSamples, calendar: calendar)
 
-        try database.insertRawSamples(newHealthSamples)
-        try database.insertRawSamplesDeduplicated(backfillSleep)
+        let heartRateAdded = try database.insertRawSamples(newHeartRateSamples)
+        let respiratoryAdded = try database.insertRawSamples(newRespiratorySamples)
+        let hrvAdded = try database.insertRawSamplesDeduplicatedIgnoringSource(newHrvSamples)
+        let sleepAdded = try database.insertRawSamplesDeduplicated(backfillSleep)
         try database.upsertMinuteRecords(aggregates)
         sleepIntervalSamples = mergedSleepIntervals(existing: sleepIntervalSamples, fresh: fetchedSleepIntervals)
+        return SyncDelta(
+            heartRateAdded: heartRateAdded,
+            respiratoryAdded: respiratoryAdded,
+            hrvAdded: hrvAdded,
+            sleepIntervalsAdded: sleepAdded
+        )
     }
 
     private func syncMotionPipeline(database: VitalDatabase, windowSince: Date) async throws {
@@ -183,7 +243,7 @@ final class VitalStore: ObservableObject {
             }
             newMotionSamples.append(contentsOf: fresh)
         }
-        try database.insertRawSamples(newMotionSamples)
+        _ = try database.insertRawSamples(newMotionSamples)
     }
 
     func startAutoSyncLoop() {
@@ -243,20 +303,32 @@ final class VitalStore: ObservableObject {
         }
     }
 
-    private func lastSyncDate() -> Date? {
-        UserDefaults.standard.object(forKey: lastSyncKey) as? Date
-    }
-
     private func saveLastSyncDate(_ date: Date) {
         UserDefaults.standard.set(date, forKey: lastSyncKey)
     }
 
-    private func lastActivitySyncDate() -> Date? {
-        UserDefaults.standard.object(forKey: lastActivitySyncKey) as? Date
-    }
-
     private func saveLastActivitySyncDate(_ date: Date) {
         UserDefaults.standard.set(date, forKey: lastActivitySyncKey)
+    }
+
+    private static func acquireSyncLock(now: Date = Date()) -> String? {
+        let defaults = UserDefaults.standard
+        let lockUntil = defaults.object(forKey: syncLockUntilKey) as? Date
+        if let lockUntil, lockUntil > now {
+            return nil
+        }
+        let token = UUID().uuidString
+        defaults.set(now.addingTimeInterval(syncLockDuration), forKey: syncLockUntilKey)
+        defaults.set(token, forKey: syncLockTokenKey)
+        return token
+    }
+
+    private static func releaseSyncLock(token: String) {
+        let defaults = UserDefaults.standard
+        let currentToken = defaults.string(forKey: syncLockTokenKey)
+        guard currentToken == token else { return }
+        defaults.removeObject(forKey: syncLockUntilKey)
+        defaults.removeObject(forKey: syncLockTokenKey)
     }
 
     private func mergedSleepIntervals(

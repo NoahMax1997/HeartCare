@@ -32,23 +32,6 @@ struct VitalMinuteRecord: Codable, Hashable, Identifiable {
     }
 }
 
-struct DailySummaryRecord: Codable, Hashable, Identifiable {
-    var id: Date { date }
-    var date: Date
-    var hrBaseline: Double
-    var rrBaseline: Double
-    var variabilityScore: Double
-    var deviationScore: Double
-
-    init(date: Date, hrBaseline: Double, rrBaseline: Double, variabilityScore: Double, deviationScore: Double) {
-        self.date = date
-        self.hrBaseline = hrBaseline
-        self.rrBaseline = rrBaseline
-        self.variabilityScore = variabilityScore
-        self.deviationScore = deviationScore
-    }
-}
-
 struct VitalSample: Sendable {
     enum Kind: Sendable {
         case heartRate

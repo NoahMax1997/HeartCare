@@ -206,7 +206,8 @@ final class HealthKitService {
         if healthKitValue == HKCategoryValueSleepAnalysis.asleepCore.rawValue {
             return 2
         }
-        return 2
+        // 未分期睡眠(asleep 或其它未知值)单独落库，后续展示层不参与处理。
+        return 1
     }
 
     private func samplePredicate(since: Date?) -> NSPredicate? {

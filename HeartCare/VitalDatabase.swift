@@ -88,8 +88,8 @@ final class VitalDatabase {
         try commitTransaction()
     }
 
-    func insertRawSamples(_ samples: [VitalSample]) throws {
-        guard !samples.isEmpty else { return }
+    func insertRawSamples(_ samples: [VitalSample]) throws -> Int {
+        guard !samples.isEmpty else { return 0 }
         let sql = """
         INSERT INTO raw_samples (timestamp, value, kind, source)
         VALUES (?, ?, ?, ?);
@@ -100,6 +100,7 @@ final class VitalDatabase {
         }
         defer { sqlite3_finalize(statement) }
 
+        var insertedCount = 0
         try beginTransaction()
         for sample in samples {
             sqlite3_reset(statement)
@@ -111,12 +112,14 @@ final class VitalDatabase {
                 try rollbackTransaction()
                 throw DatabaseError.writeFailed
             }
+            insertedCount += Int(sqlite3_changes(db))
         }
         try commitTransaction()
+        return insertedCount
     }
 
-    func insertRawSamplesDeduplicated(_ samples: [VitalSample]) throws {
-        guard !samples.isEmpty else { return }
+    func insertRawSamplesDeduplicated(_ samples: [VitalSample]) throws -> Int {
+        guard !samples.isEmpty else { return 0 }
         let sql = """
         INSERT INTO raw_samples (timestamp, value, kind, source)
         SELECT ?, ?, ?, ?
@@ -135,6 +138,7 @@ final class VitalDatabase {
         }
         defer { sqlite3_finalize(statement) }
 
+        var insertedCount = 0
         try beginTransaction()
         for sample in samples {
             sqlite3_reset(statement)
@@ -151,8 +155,51 @@ final class VitalDatabase {
                 try rollbackTransaction()
                 throw DatabaseError.writeFailed
             }
+            insertedCount += Int(sqlite3_changes(db))
         }
         try commitTransaction()
+        return insertedCount
+    }
+    
+    func insertRawSamplesDeduplicatedIgnoringSource(_ samples: [VitalSample]) throws -> Int {
+        guard !samples.isEmpty else { return 0 }
+        let sql = """
+        INSERT INTO raw_samples (timestamp, value, kind, source)
+        SELECT ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM raw_samples
+            WHERE timestamp = ?
+              AND value = ?
+              AND kind = ?
+        );
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed
+        }
+        defer { sqlite3_finalize(statement) }
+        
+        var insertedCount = 0
+        try beginTransaction()
+        for sample in samples {
+            sqlite3_reset(statement)
+            let timestamp = sample.timestamp.timeIntervalSince1970
+            sqlite3_bind_double(statement, 1, timestamp)
+            sqlite3_bind_double(statement, 2, sample.value)
+            sqlite3_bind_text(statement, 3, sample.kind.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(statement, 4, sample.source, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_double(statement, 5, timestamp)
+            sqlite3_bind_double(statement, 6, sample.value)
+            sqlite3_bind_text(statement, 7, sample.kind.rawValue, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                try rollbackTransaction()
+                throw DatabaseError.writeFailed
+            }
+            insertedCount += Int(sqlite3_changes(db))
+        }
+        try commitTransaction()
+        return insertedCount
     }
 
     func deleteRawSamples(kind: VitalSample.Kind) throws {
