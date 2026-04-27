@@ -140,10 +140,21 @@ private struct SummaryView: View {
                         }
                     }
                     .frame(height: max(((max(measuredRowWidth, 1) - cardSpacing) / 2) * 1.68, 1))
+
+                    SleepSessionStatsCard(store: store, selectedDate: selectedDate)
+                        .summaryCardSurface(
+                            cornerRadius: surfaceCornerRadius,
+                            lineWidth: surfaceLineWidth,
+                            shadowRadius: surfaceShadowRadius,
+                            shadowYOffset: surfaceShadowYOffset
+                        )
                 }
                 .padding(.top, contentSpacing * 0.25)
                 .padding(.horizontal, horizontalPadding)
                 .padding(.bottom, contentSpacing)
+            }
+            .task(id: selectedDate) {
+                await store.ensureSleepIntervalsLoaded(for: selectedDate)
             }
         }
     }
@@ -176,13 +187,15 @@ private extension View {
 
 private struct SleepDurationRingCard: View {
     @ObservedObject var store: VitalStore
+    @AppStorage("sleepGoalHours") private var sleepGoalHours: Double = 8
     let selectedDate: Date
     let ringDiameter: CGFloat
 
     var body: some View {
         let safeRingDiameter = max(ringDiameter, 1)
         let total = totalSleepDuration(for: selectedDate)
-        let goal: TimeInterval = 8 * 3600
+        let normalizedGoalHours = min(max(sleepGoalHours, 4), 12)
+        let goal: TimeInterval = normalizedGoalHours * 3600
         let progress = min(max(total / goal, 0), 1)
         let completion = progress * 100
         let averages = sleepPeriodAverages(for: selectedDate)
@@ -235,7 +248,7 @@ private struct SleepDurationRingCard: View {
             .frame(maxWidth: .infinity, alignment: .center)
 
             VStack(alignment: .leading, spacing: textBlockSpacing) {
-                Text("目标时长：8小时")
+                Text("目标时长：\(goalHoursText(normalizedGoalHours))")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.primary)
                 Text("总时长：\(durationText(total))")
@@ -261,17 +274,18 @@ private struct SleepDurationRingCard: View {
     }
 
     private func sleepIntervals(for day: Date) -> [DateInterval] {
-        let calendar = Calendar.current
-        let start = calendar.startOfDay(for: day)
-        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else { return [] }
-        return store.sleepIntervalSamples.compactMap { sample in
-            let clippedStart = max(sample.start, start)
-            let clippedEnd = min(sample.end, end)
-            guard clippedEnd > clippedStart else { return nil }
-            let stage = summarySleepStage(for: sample.value)
-            guard stage != .awake, stage != .unspecified else { return nil }
-            return DateInterval(start: clippedStart, end: clippedEnd)
-        }
+        let intervalBased = normalizedSleepIntervals(
+            from: store.sleepIntervalSamples,
+            for: day,
+            includeStages: [.deep, .core, .rem],
+            mergeAcrossStages: true
+        )
+        let pointBased = inferredSleepIntervalsFromRawSamples(
+            store.sleepSamples,
+            for: day,
+            includeStages: [.deep, .core, .rem]
+        )
+        return mergeDateIntervals(intervalBased + pointBased)
     }
 
     private func durationText(_ duration: TimeInterval) -> String {
@@ -279,6 +293,13 @@ private struct SleepDurationRingCard: View {
         let hoursPart = minutes / 60
         let minutesPart = minutes % 60
         return "\(hoursPart)小时\(minutesPart)分钟"
+    }
+
+    private func goalHoursText(_ hours: Double) -> String {
+        if abs(hours.rounded() - hours) < 0.001 {
+            return "\(Int(hours.rounded()))小时"
+        }
+        return "\(String(format: "%.1f", hours))小时"
     }
 
     private func sleepPeriodAverages(for day: Date) -> (respiratory: Double?, hrv: Double?) {
@@ -382,17 +403,19 @@ private struct SleepStagesRingCard: View {
     }
 
     private func sleepStageDurations(for day: Date) -> [SummarySleepStage: TimeInterval] {
-        let calendar = Calendar.current
-        let start = calendar.startOfDay(for: day)
-        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else { return [:] }
         var result: [SummarySleepStage: TimeInterval] = [.deep: 0, .core: 0, .rem: 0, .awake: 0]
-        for sample in store.sleepIntervalSamples {
-            let stage = summarySleepStage(for: sample.value)
-            guard stage != .unspecified else { continue }
-            let clippedStart = max(sample.start, start)
-            let clippedEnd = min(sample.end, end)
-            guard clippedEnd > clippedStart else { continue }
-            result[stage, default: 0] += clippedEnd.timeIntervalSince(clippedStart)
+
+        for stage in [SummarySleepStage.deep, .core, .rem, .awake] {
+            let merged = normalizedSleepIntervals(
+                from: store.sleepIntervalSamples,
+                for: day,
+                includeStages: [stage],
+                mergeAcrossStages: false
+            )
+            let total = merged.reduce(0) { partial, interval in
+                partial + max(0, interval.end.timeIntervalSince(interval.start))
+            }
+            result[stage] = total
         }
         return result
     }
@@ -408,17 +431,12 @@ private struct SleepStagesRingCard: View {
     }
 
     private func sleepIntervals(for day: Date) -> [DateInterval] {
-        let calendar = Calendar.current
-        let start = calendar.startOfDay(for: day)
-        guard let end = calendar.date(byAdding: .day, value: 1, to: start) else { return [] }
-        return store.sleepIntervalSamples.compactMap { sample in
-            let clippedStart = max(sample.start, start)
-            let clippedEnd = min(sample.end, end)
-            guard clippedEnd > clippedStart else { return nil }
-            let stage = summarySleepStage(for: sample.value)
-            guard stage != .awake, stage != .unspecified else { return nil }
-            return DateInterval(start: clippedStart, end: clippedEnd)
-        }
+        normalizedSleepIntervals(
+            from: store.sleepIntervalSamples,
+            for: day,
+            includeStages: [.deep, .core, .rem],
+            mergeAcrossStages: true
+        )
     }
 
     private func formatHeartRate(_ value: Double?) -> String {
@@ -512,7 +530,7 @@ private struct SleepStagesRingCard: View {
                 .stroke(stage.color, style: StrokeStyle(lineWidth: ringLineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
 
-            if progress > 0.01 {
+            if duration > 0 {
                 arcStartIcon(
                     icon: stage.icon,
                     diameter: diameter,
@@ -569,6 +587,167 @@ private struct SleepStagesRingCard: View {
         return "\(hoursPart)时\(minutesPart)分"
     }
 
+}
+
+private struct SleepSessionStatsCard: View {
+    @ObservedObject var store: VitalStore
+    let selectedDate: Date
+
+    var body: some View {
+        let segments = sleepSegments(for: selectedDate)
+        let displayedRows = displayRows(from: segments)
+
+        VStack(alignment: .leading, spacing: 12) {
+            Text("睡眠段统计（总睡眠段数：\(segments.count)）")
+                .font(.headline)
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text("粗略估计")
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.orange)
+
+            if segments.isEmpty {
+                Text("该日期暂无睡眠段数据")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                sessionTableHeader()
+                ForEach(Array(displayedRows.enumerated()), id: \.offset) { _, row in
+                    switch row {
+                    case .segment(let index, let segment):
+                        sessionTableRow(index: index, segment: segment)
+                    case .ellipsis:
+                        HStack {
+                            Text("...")
+                                .frame(width: 28, alignment: .leading)
+                                .foregroundStyle(.secondary)
+                            Text("中间段已省略")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func sleepSegments(for day: Date) -> [DateInterval] {
+        let calendar = Calendar.current
+        let dayStart = calendar.startOfDay(for: day)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else { return [] }
+
+        let intervalBased: [DateInterval] = store.sleepIntervalSamples.compactMap { interval in
+            if interval.start == interval.end {
+                guard interval.start >= dayStart && interval.start < dayEnd else { return nil }
+            } else {
+                guard interval.end > dayStart && interval.start < dayEnd else { return nil }
+            }
+            var start = max(interval.start, dayStart)
+            var end = min(interval.end, dayEnd)
+            if start >= end {
+                let center = max(min(interval.end, dayEnd), dayStart)
+                start = max(center.addingTimeInterval(-5 * 60), dayStart)
+                end = min(center.addingTimeInterval(5 * 60), dayEnd)
+            }
+            guard start < end else { return nil }
+            return DateInterval(start: start, end: end)
+        }
+        return mergeIntervalsWithAdaptiveGap(intervalBased)
+            .sorted { $0.start < $1.start }
+    }
+
+    private func timeText(_ date: Date?) -> String {
+        guard let date else { return "--:--" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
+    }
+
+    private func durationText(_ interval: DateInterval) -> String {
+        let totalMinutes = max(0, Int(interval.duration / 60))
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return "\(hours)时\(minutes)分"
+    }
+
+    private func sessionTableHeader() -> some View {
+        HStack {
+            Text("段")
+                .frame(width: 28, alignment: .leading)
+            Text("入睡")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("醒来")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("时长")
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .font(.footnote.weight(.semibold))
+        .foregroundStyle(.secondary)
+    }
+
+    private func sessionTableRow(index: Int, segment: DateInterval) -> some View {
+        HStack {
+            Text("\(index)")
+                .frame(width: 28, alignment: .leading)
+                .foregroundStyle(.secondary)
+            Text(timeText(segment.start))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(timeText(segment.end))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(durationText(segment))
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .fontWeight(.semibold)
+        }
+        .font(.callout.weight(.medium))
+    }
+
+    private enum SleepSegmentDisplayRow {
+        case segment(index: Int, segment: DateInterval)
+        case ellipsis
+    }
+
+    private func displayRows(from segments: [DateInterval]) -> [SleepSegmentDisplayRow] {
+        if segments.count <= 3 {
+            return segments.enumerated().map { .segment(index: $0.offset + 1, segment: $0.element) }
+        }
+        return [
+            .segment(index: 1, segment: segments[0]),
+            .segment(index: 2, segment: segments[1]),
+            .ellipsis,
+            .segment(index: segments.count, segment: segments[segments.count - 1])
+        ]
+    }
+
+    private func mergeIntervalsWithAdaptiveGap(_ intervals: [DateInterval]) -> [DateInterval] {
+        guard !intervals.isEmpty else { return [] }
+        let calendar = Calendar.current
+        let sorted = intervals.sorted { $0.start < $1.start }
+        var merged: [DateInterval] = [sorted[0]]
+        for interval in sorted.dropFirst() {
+            guard let last = merged.last else { continue }
+            let bridgeTime = Date(
+                timeIntervalSinceReferenceDate:
+                    (last.end.timeIntervalSinceReferenceDate + interval.start.timeIntervalSinceReferenceDate) / 2
+            )
+            let hour = calendar.component(.hour, from: bridgeTime)
+            let gap: TimeInterval = isDayHour(hour) ? 20 * 60 : 30 * 60
+            if interval.start.timeIntervalSince(last.end) <= gap {
+                merged[merged.count - 1] = DateInterval(start: last.start, end: max(last.end, interval.end))
+            } else {
+                merged.append(interval)
+            }
+        }
+        return merged
+    }
+
+    private func isDayHour(_ hour: Int) -> Bool {
+        hour >= 19 || hour < 10
+    }
 }
 
 private enum SummarySleepStage {
@@ -630,6 +809,130 @@ private func summarySleepStage(for storedValue: Double) -> SummarySleepStage {
     if storedValue >= 3.5 { return .deep }
     if storedValue >= 2.5 { return .rem }
     return .core
+}
+
+private func normalizedSleepIntervals(
+    from samples: [SleepIntervalSample],
+    for day: Date,
+    includeStages: Set<SummarySleepStage>,
+    mergeAcrossStages: Bool
+) -> [DateInterval] {
+    let calendar = Calendar.current
+    let start = calendar.startOfDay(for: day)
+    guard let end = calendar.date(byAdding: .day, value: 1, to: start) else { return [] }
+
+    var seenKeys = Set<String>()
+    let clipped: [(stage: SummarySleepStage, interval: DateInterval)] = samples.compactMap { sample in
+        let stage = summarySleepStage(for: sample.value)
+        guard includeStages.contains(stage) else { return nil }
+        let clippedStart = max(sample.start, start)
+        let clippedEnd = min(sample.end, end)
+        guard clippedEnd > clippedStart else { return nil }
+        let key = "\(clippedStart.timeIntervalSince1970)-\(clippedEnd.timeIntervalSince1970)-\(stage)"
+        guard seenKeys.insert(key).inserted else { return nil }
+        return (stage, DateInterval(start: clippedStart, end: clippedEnd))
+    }
+
+    if mergeAcrossStages {
+        return mergeDateIntervals(clipped.map(\.interval))
+    }
+
+    var merged: [DateInterval] = []
+    for stage in includeStages {
+        let stageIntervals = clipped.filter { $0.stage == stage }.map(\.interval)
+        merged.append(contentsOf: mergeDateIntervals(stageIntervals))
+    }
+    return merged
+}
+
+private func mergeDateIntervals(_ intervals: [DateInterval]) -> [DateInterval] {
+    guard !intervals.isEmpty else { return [] }
+    let sorted = intervals.sorted { $0.start < $1.start }
+    var merged: [DateInterval] = [sorted[0]]
+
+    for interval in sorted.dropFirst() {
+        guard let last = merged.last else { continue }
+        if interval.start <= last.end {
+            merged[merged.count - 1] = DateInterval(start: last.start, end: max(last.end, interval.end))
+        } else {
+            merged.append(interval)
+        }
+    }
+    return merged
+}
+
+private func inferredSleepIntervalsFromRawSamples(
+    _ samples: [RawVitalSampleRecord],
+    for day: Date,
+    includeStages: Set<SummarySleepStage>
+) -> [DateInterval] {
+    let calendar = Calendar.current
+    let dayStart = calendar.startOfDay(for: day)
+    guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else { return [] }
+
+    let points = samples
+        .filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd }
+        .sorted { $0.timestamp < $1.timestamp }
+    guard !points.isEmpty else { return [] }
+
+    let maxGap: TimeInterval = 60 * 60
+    let minimumDuration: TimeInterval = 20 * 60
+    var intervals: [DateInterval] = []
+
+    var segmentStart = points[0].timestamp
+    var lastTimestamp = points[0].timestamp
+    var segmentStage = summarySleepStage(for: points[0].value)
+
+    for point in points.dropFirst() {
+        let pointStage = summarySleepStage(for: point.value)
+        let gap = point.timestamp.timeIntervalSince(lastTimestamp)
+        if gap <= maxGap && pointStage == segmentStage {
+            lastTimestamp = point.timestamp
+            continue
+        }
+
+        if includeStages.contains(segmentStage) {
+            var start = segmentStart
+            var end = lastTimestamp
+            if end <= start {
+                start = start.addingTimeInterval(-5 * 60)
+                end = end.addingTimeInterval(5 * 60)
+            } else if end.timeIntervalSince(start) < minimumDuration {
+                let half = minimumDuration / 2
+                start = start.addingTimeInterval(-half)
+                end = end.addingTimeInterval(half)
+            }
+            start = max(start, dayStart)
+            end = min(end, dayEnd)
+            if start < end {
+                intervals.append(DateInterval(start: start, end: end))
+            }
+        }
+
+        segmentStart = point.timestamp
+        lastTimestamp = point.timestamp
+        segmentStage = pointStage
+    }
+
+    if includeStages.contains(segmentStage) {
+        var start = segmentStart
+        var end = lastTimestamp
+        if end <= start {
+            start = start.addingTimeInterval(-5 * 60)
+            end = end.addingTimeInterval(5 * 60)
+        } else if end.timeIntervalSince(start) < minimumDuration {
+            let half = minimumDuration / 2
+            start = start.addingTimeInterval(-half)
+            end = end.addingTimeInterval(half)
+        }
+        start = max(start, dayStart)
+        end = min(end, dayEnd)
+        if start < end {
+            intervals.append(DateInterval(start: start, end: end))
+        }
+    }
+
+    return mergeDateIntervals(intervals)
 }
 
 private struct SyncStatusCard: View {
@@ -829,6 +1132,7 @@ private struct DashboardView: View {
             }
         }
         .task(id: selectedDate) {
+            await store.ensureSleepIntervalsLoaded(for: selectedDate)
             if selectedKind == .heartRate {
                 restingReferenceForDay = await store.fetchRestingHeartRateReference(for: selectedDate)
                 replayLineAnimation(totalPoints: points.count)
@@ -2435,6 +2739,7 @@ private struct RawSampleDetailView: View {
 
 private struct SettingsView: View {
     @ObservedObject var store: VitalStore
+    @AppStorage("sleepGoalHours") private var sleepGoalHours: Double = 8
     private let statColumns = [
         GridItem(.flexible(), spacing: 10),
         GridItem(.flexible(), spacing: 10)
@@ -2458,6 +2763,23 @@ private struct SettingsView: View {
                 )
                     .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                     .listRowBackground(Color(.systemGroupedBackground))
+            }
+
+            Section("睡眠目标") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("目标时长")
+                        Spacer()
+                        Text("\(sleepGoalLabel)")
+                            .foregroundStyle(.secondary)
+                    }
+                    Stepper(value: $sleepGoalHours, in: 4...12, step: 0.5) {
+                        Text("调整睡眠目标")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
             }
 
             Section("样本概览") {
@@ -2514,6 +2836,13 @@ private struct SettingsView: View {
                 .stroke(Color.black.opacity(0.06), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var sleepGoalLabel: String {
+        if abs(sleepGoalHours.rounded() - sleepGoalHours) < 0.001 {
+            return "\(Int(sleepGoalHours.rounded())) 小时"
+        }
+        return "\(String(format: "%.1f", sleepGoalHours)) 小时"
     }
 }
 

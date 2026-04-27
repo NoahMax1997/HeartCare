@@ -61,6 +61,18 @@ final class HealthKitService {
         }
     }
 
+    func fetchSleepIntervals(in interval: DateInterval) async throws -> [SleepIntervalSample] {
+        let samples = try await fetchSleepCategorySamples(in: interval)
+        return samples.map { sample in
+            SleepIntervalSample(
+                start: sample.startDate,
+                end: sample.endDate,
+                value: mappedSleepStageValue(from: sample.value),
+                source: sample.sourceRevision.source.name
+            )
+        }
+    }
+
     private func fetchQuantitySamples(
         type: HKQuantityType,
         since: Date?,
@@ -188,6 +200,16 @@ final class HealthKitService {
         guard let sleepAnalysisType else { return [] }
         let descriptor = HKSampleQueryDescriptor(
             predicates: [.categorySample(type: sleepAnalysisType, predicate: samplePredicate(since: since))],
+            sortDescriptors: [SortDescriptor(\.endDate, order: .forward)]
+        )
+        return try await descriptor.result(for: store)
+    }
+
+    private func fetchSleepCategorySamples(in interval: DateInterval) async throws -> [HKCategorySample] {
+        guard let sleepAnalysisType else { return [] }
+        let predicate = HKQuery.predicateForSamples(withStart: interval.start, end: interval.end, options: [])
+        let descriptor = HKSampleQueryDescriptor(
+            predicates: [.categorySample(type: sleepAnalysisType, predicate: predicate)],
             sortDescriptors: [SortDescriptor(\.endDate, order: .forward)]
         )
         return try await descriptor.result(for: store)

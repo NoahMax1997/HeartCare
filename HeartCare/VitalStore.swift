@@ -40,6 +40,7 @@ final class VitalStore: ObservableObject {
     private let autoSyncIntervalNanoseconds: UInt64 = 10 * 60 * 1_000_000_000
     private let database: VitalDatabase?
     private var autoSyncTask: Task<Void, Never>?
+    private var loadedSleepIntervalDays: Set<Date> = []
     private static let syncLockUntilKey = "vital.syncLockUntil"
     private static let syncLockTokenKey = "vital.syncLockToken"
     private static let syncLockDuration: TimeInterval = 120
@@ -122,7 +123,7 @@ final class VitalStore: ObservableObject {
 
         let manualWindowSince = calendar.date(byAdding: .day, value: -7, to: Date())
             ?? Date().addingTimeInterval(-7 * 24 * 3600)
-        await runIndependentSyncPipelines(
+        _ = await runIndependentSyncPipelines(
             database: database,
             healthWindowSince: manualWindowSince,
             motionWindowSince: manualWindowSince,
@@ -300,6 +301,29 @@ final class VitalStore: ObservableObject {
         } catch {
             lastError = "读取 HRV 失败: \(error.localizedDescription)"
             return hrvSdnn
+        }
+    }
+
+    func ensureSleepIntervalsLoaded(for day: Date) async {
+        let dayStart = calendar.startOfDay(for: day)
+        if loadedSleepIntervalDays.contains(dayStart) {
+            return
+        }
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
+            return
+        }
+        let queryStart = calendar.date(byAdding: .day, value: -1, to: dayStart) ?? dayStart
+        let queryEnd = calendar.date(byAdding: .day, value: 1, to: dayEnd) ?? dayEnd
+        let queryRange = DateInterval(start: queryStart, end: queryEnd)
+
+        do {
+            let fetched = try await healthKitService.fetchSleepIntervals(in: queryRange)
+            sleepIntervalSamples = mergedSleepIntervals(existing: sleepIntervalSamples, fresh: fetched)
+            if !fetched.isEmpty {
+                loadedSleepIntervalDays.insert(dayStart)
+            }
+        } catch {
+            lastError = "按日期补拉睡眠数据失败: \(error.localizedDescription)"
         }
     }
 
